@@ -30,3 +30,6 @@ Thumbs.db
 .vscode/
 .idea/
 genshin_voice.py
+
+# Защита от любых файлов моделей
+*.pt

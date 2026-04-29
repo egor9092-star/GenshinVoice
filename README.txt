@@ -61,8 +61,8 @@
 
 Программа распространяется под лицензией GNU General Public License v3.0.
 
-Модель Silero TTS (model.pt) не включена в этот репозиторий и предоставляется пользователем отдельно под лицензией CC BY-NC-SA 4.0.
-Благодарности
+Модель Silero TTS (v4_ru.pt) предоставляется под лицензией CC BY-NC-SA 4.0 
+(https://creativecommons.org/licenses/by-nc-sa/4.0/).
 
     Команде Silero за открытую TTS‑модель.
 
