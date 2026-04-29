@@ -1,26 +1,26 @@
-# Модель Silero – не должна распространяться в репозитории
+# Модель Silero
 model.pt
 
-# Конфигурация пользователя (область, голос)
+# Конфиг пользователя
 config.json
 
-# Виртуальное окружение Python
-venv/
-env/
-.venv/
+# Батник для запуска
+run_genshin.bat
 
-# Кэш и скомпилированные файлы Python
+# Виртуальные окружения и сборки
+venv/
+build_env/
+build/
+dist/
+specfile/
+
+# Кэш Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
-# Файлы сборки PyInstaller
-build/
-dist/
-*.spec
-
-# Временные файлы и папки
+# Временные файлы
 *.log
 *.tmp
 .DS_Store
@@ -29,5 +29,4 @@ Thumbs.db
 # Настройки IDE
 .vscode/
 .idea/
-
-run_genshin.bat
+genshin_voice.py
