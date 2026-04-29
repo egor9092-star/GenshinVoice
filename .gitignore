@@ -29,3 +29,5 @@ Thumbs.db
 # Настройки IDE
 .vscode/
 .idea/
+
+run_genshin.bat
