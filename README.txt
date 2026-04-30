@@ -39,8 +39,8 @@ Genshin Voice
    cd GenshinVoice
 3. Установите основные зависимости:
    pip install -r requirements.txt
-4. Установите PyTorch (версия только для процессора, без поддержки CUDA):
-   pip install torch --index-url https://download.pytorch.org/whl/cpu
+4. Установите PyTorch версии 2.4.1 (строго для процессора):
+   pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cpu
 5. Поместите Tesseract OCR в папку bin\tesseract\ рядом с main.py:
    - Скачайте портативную версию Tesseract (архив с бинарниками) с https://github.com/UB-Mannheim/tesseract/wiki или другого надёжного источника.
    - Создайте структуру:
@@ -94,6 +94,11 @@ Genshin Voice
 
 7. При запуске из исходного кода возникает ошибка OSError: ... c10.dll ...
    - Это связано с конфликтом DLL при импорте PyTorch. Решение: перед первым запуском удалите файл config.json (если он существует) и убедитесь, что используется версия PyTorch для CPU. При старте программа переключится на Windows Voice и будет работать.
+
+8. Ошибка c10.dll при использовании Silero Voice
+   Эта ошибка возникает с некоторыми версиями PyTorch.
+   Решение: удалите текущую версию (`pip uninstall torch -y`) и установите строго 2.4.1 для CPU:
+   pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cpu
 
 Дисклеймер
 Этот проект является некоммерческим инструментом для личного использования. Он не связан с HoYoverse и не имеет к компании никакого отношения.
