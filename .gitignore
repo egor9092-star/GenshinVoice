@@ -1,35 +1,32 @@
-# Модель Silero
+# Виртуальное окружение
+venv/
+
+# Сборка PyInstaller
+dist/
+build/
+
+# Модель Silero (не распространяется с исходниками)
 model.pt
 
-# Конфиг пользователя
+# Локальные настройки
 config.json
 
-# Батник для запуска
+# Старые и вспомогательные скрипты
+genshin_voice.py
 run_genshin.bat
 
-# Виртуальные окружения и сборки
-venv/
-build_env/
-build/
-dist/
-specfile/
+# Папка с Tesseract (пользователь скачивает самостоятельно)
+bin/
 
-# Кэш Python
+# Кеш Python
 __pycache__/
 *.pyc
 *.pyo
-*.pyd
 
-# Временные файлы
-*.log
-*.tmp
-.DS_Store
-Thumbs.db
-
-# Настройки IDE
+# IDE
 .vscode/
 .idea/
-genshin_voice.py
 
-# Защита от любых файлов моделей
-*.pt
+# Системные файлы Windows
+Thumbs.db
+Desktop.ini

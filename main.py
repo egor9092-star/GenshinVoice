@@ -1,5 +1,4 @@
 import sys, os
-# Защита от отсутствия stderr в EXE без консоли
 if sys.stderr is None:
     sys.stderr = open(os.devnull, 'w')
 
@@ -11,71 +10,145 @@ import traceback
 import numpy as np
 import cv2
 from PIL import ImageGrab
-import easyocr
+import pytesseract
 from difflib import SequenceMatcher
 import threading
 from queue import Queue
-import torch
 import sounddevice as sd
 import requests
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTextEdit, QStatusBar, QDesktopWidget,
-    QComboBox, QProgressBar, QMessageBox, QTabWidget, QTextBrowser
+    QComboBox, QProgressBar, QMessageBox, QTabWidget, QTextBrowser, QFileDialog
 )
-from PyQt5.QtCore import Qt, QRect, QPoint, pyqtSignal, QObject, QTimer
+from PyQt5.QtCore import Qt, QRect, QPoint, pyqtSignal, QObject, QTimer, Q_ARG
 from PyQt5.QtGui import QFont, QPixmap, QPainter, QPen, QColor, QImage
 
 # ---------------------- НАСТРОЙКИ ----------------------
 APP_NAME = "Genshin Voice"
 
-# Определяем папку, в которой находится исполняемый файл (или скрипт)
 if getattr(sys, 'frozen', False):
-    # Если программа собрана PyInstaller, sys.executable указывает на .exe
     BASE_DIR = os.path.dirname(sys.executable)
 else:
-    # Обычный запуск .py
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CONFIG_PATH = os.path.join(BASE_DIR, 'config.json')
 MODEL_PATH = os.path.join(BASE_DIR, 'model.pt')
 OFFICIAL_MODEL_URL = 'https://models.silero.ai/models/tts/ru/v4_ru.pt'
 SILERO_VOICES = ['aidar', 'baya', 'eugene', 'kseniya', 'xenia', 'random']
-SAMPLE_RATE = 24000
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+SAMPLE_RATE = 48000
+DEVICE = 'cpu'
+
+# ----------- НАСТРОЙКА TESSERACT ------------------------
+def find_tesseract():
+    """Ищет tesseract.exe и возвращает полный путь или None."""
+    # Путь рядом с exe (актуально для обычного запуска и --onedir, если положить рядом)
+    local = os.path.join(BASE_DIR, 'bin', 'tesseract', 'tesseract.exe')
+    if os.path.isfile(local):
+        return local
+    # Путь внутри _internal (для PyInstaller --onedir)
+    internal = os.path.join(BASE_DIR, '_internal', 'bin', 'tesseract', 'tesseract.exe')
+    if os.path.isfile(internal):
+        return internal
+    return None
+
+def configure_tesseract(tesseract_path):
+    """Применяет путь к Tesseract и возвращает путь к tessdata."""
+    pytesseract.pytesseract.tesseract_cmd = tesseract_path
+    tessdata_dir = os.path.join(os.path.dirname(tesseract_path), 'tessdata')
+    os.environ['TESSDATA_PREFIX'] = tessdata_dir
+    return tessdata_dir
+
+# Глобальная переменная для хранения пути
+TESSERACT_PATH = find_tesseract()
+if TESSERACT_PATH:
+    configure_tesseract(TESSERACT_PATH)
 # -------------------------------------------------------
 
 voice_queue = Queue()
 history = []
+last_voiced_text = ""
 paused = False
 tts_model = None
-ocr_reader = None
 sapi_voice = None
 use_silero_voice = False
 current_silero_speaker = SILERO_VOICES[0]
+genshin_active = False          # флаг активности окна игры
 
 # --- вспомогательные функции ---
 def improve_speech(text):
-    if not text: return ""
-    yo_map = {'еще': 'ещё', 'все': 'всё', 'идет': 'идёт', 'пришел': 'пришёл',
-              'свое': 'своё', 'твое': 'твоё', 'ее': 'её', 'нее': 'неё'}
+    if not text:
+        return ""
+
+    brackets = [
+        '<<', '>>', '«', '»', '"', '"',
+        '\u201c', '\u201d', '(', ')', '[', ']', '{', '}', '<', '>'
+    ]
+    for b in brackets:
+        text = text.replace(b, ' ')
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    # Замена цифр на слова
+    number_words = {
+        '0': 'ноль', '1': 'один', '2': 'два', '3': 'три',
+        '4': 'четыре', '5': 'пять', '6': 'шесть',
+        '7': 'семь', '8': 'восемь', '9': 'девять',
+        '10': 'десять'
+    }
+    for digit, word in number_words.items():
+        text = re.sub(rf'(?<!\d){digit}(?!\d)', word, text)
+
+    ocr_fixes = {
+        'Дзынь-лащ': 'Дзынь-клац',
+        'Дзынь лащ': 'Дзынь-клац',
+    }
+    for wrong, right in ocr_fixes.items():
+        text = text.replace(wrong, right)
+
+    yo_map = {
+        'еще': 'ещё', 'идет': 'идёт', 'пришел': 'пришёл',
+        'свое': 'своё', 'твое': 'твоё', 'ее': 'её', 'нее': 'неё'
+    }
     for word, replacement in yo_map.items():
         text = re.sub(rf'\b{word}\b', replacement, text, flags=re.IGNORECASE)
+
     text = text.replace("...", " — ").replace(".", ". ")
-    accents = {"Архонт": "Арх+онт", "Паймон": "П+аймон", "Ли Юэ": "Ли Ю+э"}
+
+    accents = {
+        "Архонт": "Арх+онт", "Паймон": "П+аймон", "Ли Юэ": "Ли Ю+э",
+        "большая": "больш+ая", "Большая": "Больш+ая",
+        "вести": "вест+и", "Вести": "Вест+и",
+        "стариком": "старик+ом", "Стариком": "Старик+ом",
+        "Ему": "Е+му", "ему": "е+му",
+        "никого": "никог+о", "Никого": "Никог+о",
+    }
     for word, replacement in accents.items():
         text = text.replace(word, replacement)
+
     return text
 
 def clean_ocr_text(text):
-    text = re.sub(r'[^а-яА-ЯёЁ\s.,!?—\-]', '', text)
+    text = re.sub(r'[^а-яА-ЯёЁ0-9R\s.,!?—\-]', '', text)
     return re.sub(r'\s+', ' ', text).strip()
 
-def preprocess_image(img_bgr):
+def get_text_from_image(img_bgr):
+    if img_bgr is None:
+        return ""
+
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     _, mask = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-    return cv2.bitwise_not(mask)
+    clean = cv2.bitwise_not(mask)
+    upscaled = cv2.resize(clean, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_LANCZOS4)
+    _, binary = cv2.threshold(upscaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    config = r'--oem 3 --psm 6'
+    try:
+        text = pytesseract.image_to_string(binary, lang='rus', config=config)
+        return text.strip().replace('\n', ' ')
+    except Exception as e:
+        print(f"Ошибка Tesseract: {e}")
+        return ""
 
 # --- Перенаправление stdout ---
 class StdoutRedirector(QObject):
@@ -150,7 +223,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(750, 650)
+        self.resize(750, 700)
 
         self.dialogue_area = None
         self.paused = False
@@ -159,29 +232,48 @@ class MainWindow(QMainWindow):
         self.calibration_timer = QTimer(self)
         self.calibration_timer.timeout.connect(self._calibration_tick)
 
-        # Загрузка конфигурации
         self.load_config()
-
-        # Инициализация SAPI
         self.init_sapi()
 
-        # Центральный виджет с вкладками
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
 
-        # --- Вкладка "Main" ---
         main_tab = QWidget()
         layout = QVBoxLayout(main_tab)
-
-        gpu_text = "CUDA - OK" if DEVICE.type == 'cuda' else "CUDA NOT AVAILABLE (CPU)"
+        
+        gpu_layout = QHBoxLayout()
+        gpu_text = "CUDA NOT AVAILABLE (CPU)"
         self.gpu_label = QLabel(f"GPU: {gpu_text}")
         self.gpu_label.setFont(QFont("Arial", 10))
         layout.addWidget(self.gpu_label)
+        
+        gpu_layout.addStretch()
+
+        self.game_status_label = QLabel("Genshin Impact: проверка...")
+        self.game_status_label.setFont(QFont("Arial", 10))
+        gpu_layout.addWidget(self.game_status_label)
+
+        layout.addLayout(gpu_layout)
 
         self.status_label = QLabel("Статус: Готов (Windows Voice)")
         layout.addWidget(self.status_label)
 
-        # Управление голосом
+        # Блок настройки Tesseract
+        tess_layout = QHBoxLayout()
+        tess_layout.addWidget(QLabel("Tesseract:"))
+        self.tess_path_label = QLabel("Не найден")
+        self.tess_path_label.setStyleSheet("color: red;")
+        tess_layout.addWidget(self.tess_path_label)
+        self.tess_btn = QPushButton("📂 Указать Tesseract")
+        self.tess_btn.setToolTip(
+            "Укажите полный путь к tesseract.exe.\n"
+            "Папка tessdata должна находиться рядом с этим файлом."
+        )
+        self.tess_btn.clicked.connect(self.select_tesseract)
+        tess_layout.addWidget(self.tess_btn)
+        layout.addLayout(tess_layout)
+
+        # Голосовые движки
         voice_sel_layout = QHBoxLayout()
         self.win_btn = QPushButton("🔊 Windows Voice")
         self.win_btn.setCheckable(True)
@@ -197,7 +289,6 @@ class MainWindow(QMainWindow):
         voice_sel_layout.addWidget(self.silero_btn)
         layout.addLayout(voice_sel_layout)
 
-        # Выбор голоса Silero
         silero_sub_layout = QHBoxLayout()
         silero_sub_layout.addWidget(QLabel("Голос Silero:"))
         self.silero_combo = QComboBox()
@@ -210,12 +301,10 @@ class MainWindow(QMainWindow):
         silero_sub_layout.addWidget(self.silero_combo)
         layout.addLayout(silero_sub_layout)
 
-        # Прогресс-бар
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar)
 
-        # Кнопки управления
         btn_layout = QHBoxLayout()
         self.calibrate_btn = QPushButton("📷 Калибровать область")
         self.calibrate_btn.clicked.connect(self.start_calibration_countdown)
@@ -227,18 +316,16 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self.pause_btn)
         layout.addLayout(btn_layout)
 
-        # Лог
         self.log_widget = QTextEdit()
         self.log_widget.setReadOnly(True)
         self.log_widget.setFont(QFont("Consolas", 9))
         layout.addWidget(self.log_widget)
 
-        # Строка состояния
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.update_status_bar()
 
-        # --- Вкладка "About" ---
+        # Вкладка About
         about_tab = QWidget()
         about_layout = QVBoxLayout(about_tab)
         about_text = QTextBrowser()
@@ -249,53 +336,60 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(main_tab, "Main")
         self.tabs.addTab(about_tab, "About")
 
-        # Перенаправление stdout
         self.stdout_redirector = StdoutRedirector()
         self.stdout_redirector.text_signal.connect(self.log_widget.append)
         sys.stdout = self.stdout_redirector
 
-        # Перехват исключений
         def gui_excepthook(exc_type, exc_value, tb):
             msg = ''.join(traceback.format_exception(exc_type, exc_value, tb))
             self.log_widget.append(f"КРИТИЧЕСКАЯ ОШИБКА:\n{msg}")
             sys.__excepthook__(exc_type, exc_value, tb)
         sys.excepthook = gui_excepthook
 
-        # Загрузка модели Silero, если была выбрана ранее
         self.init_tts_model_if_needed()
-
-        # OCR и запуск потоков
-        self.init_ocr()
+        self.update_tesseract_status()
+        self.update_genshin_status(False)
+        self.game_check_timer = QTimer()
+        self.game_check_timer.timeout.connect(self.check_game_window)
+        self.game_check_timer.start(500)
         self.start_worker_threads()
-        print("Программа готова.")
+        self.check_game_window()
+        QTimer.singleShot(0, self.show_tesseract_help_if_needed)
+        print("Программа готова (Tesseract).")
 
     # --- Работа с конфигурацией ---
     def load_config(self):
-        global use_silero_voice, current_silero_speaker
+        global use_silero_voice, current_silero_speaker, TESSERACT_PATH
         default_config = {
             "dialogue_area": None,
             "use_silero_voice": False,
-            "current_silero_speaker": SILERO_VOICES[0]
+            "current_silero_speaker": SILERO_VOICES[0],
+            "tesseract_path": ""
         }
         try:
             if os.path.exists(CONFIG_PATH):
                 with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
                     config = json.load(f)
-                for key in default_config:
-                    if key not in config:
-                        config[key] = default_config[key]
-                self.dialogue_area = config['dialogue_area']
-                use_silero_voice = config['use_silero_voice']
-                current_silero_speaker = config.get('current_silero_speaker', SILERO_VOICES[0])
-                if current_silero_speaker not in SILERO_VOICES:
-                    current_silero_speaker = SILERO_VOICES[0]
-                if use_silero_voice and not os.path.exists(MODEL_PATH):
-                    use_silero_voice = False
-                    print("Модель Silero не найдена, переключение на Windows Voice.")
             else:
-                self.dialogue_area = None
-                use_silero_voice = False
+                config = default_config
+            for key in default_config:
+                if key not in config:
+                    config[key] = default_config[key]
+            self.dialogue_area = config['dialogue_area']
+            use_silero_voice = config['use_silero_voice']
+            current_silero_speaker = config.get('current_silero_speaker', SILERO_VOICES[0])
+            if current_silero_speaker not in SILERO_VOICES:
                 current_silero_speaker = SILERO_VOICES[0]
+            # Загрузка пути Tesseract
+            saved_tess_path = config.get('tesseract_path', '')
+            if saved_tess_path and os.path.isfile(saved_tess_path):
+                TESSERACT_PATH = saved_tess_path
+                configure_tesseract(TESSERACT_PATH)
+            elif TESSERACT_PATH is None and saved_tess_path:
+                pass
+            if use_silero_voice and not os.path.exists(MODEL_PATH):
+                use_silero_voice = False
+                print("Модель Silero не найдена, переключение на Windows Voice.")
         except Exception as e:
             print(f"Ошибка загрузки конфигурации: {e}")
             self.dialogue_area = None
@@ -306,7 +400,8 @@ class MainWindow(QMainWindow):
         config = {
             "dialogue_area": self.dialogue_area,
             "use_silero_voice": use_silero_voice,
-            "current_silero_speaker": current_silero_speaker
+            "current_silero_speaker": current_silero_speaker,
+            "tesseract_path": TESSERACT_PATH if TESSERACT_PATH else ""
         }
         try:
             with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
@@ -315,11 +410,11 @@ class MainWindow(QMainWindow):
             print(f"Ошибка сохранения конфигурации: {e}")
 
     def init_tts_model_if_needed(self):
-        """Если в настройках выбран Silero и модель существует, загружаем её сразу."""
         global tts_model, use_silero_voice
         if use_silero_voice and os.path.exists(MODEL_PATH) and tts_model is None:
             try:
-                print("Загружаю модель Silero в память (из конфига)...")
+                import torch
+                print("Загружаю модель Silero в память...")
                 tts_model = torch.package.PackageImporter(MODEL_PATH).load_pickle('tts_models', 'model')
                 tts_model.to(DEVICE)
                 print("Модель Silero готова.")
@@ -327,7 +422,6 @@ class MainWindow(QMainWindow):
                 print(f"Ошибка загрузки модели Silero при старте: {e}")
                 use_silero_voice = False
                 self.save_config()
-        # Обновляем интерфейс
         if use_silero_voice:
             self.win_btn.setChecked(False)
             self.silero_btn.setChecked(True)
@@ -340,76 +434,47 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Статус: Windows Voice")
 
     def _get_about_html(self):
-        return """
-        <h2>Genshin Voice</h2>
-        <p><b>Dialogue voiceover tool for Genshin Impact</b></p>
-        <p>
-        This program is free software distributed under the terms of the
-        <a href="https://www.gnu.org/licenses/gpl-3.0.html">GNU General Public License v3.0 (GPLv3)</a>.
-        You may freely use, modify, and distribute this program, provided that any
-        derivative works are also distributed under the same license.
-        </p>
-        <h3>Third-party components and licenses</h3>
-        <ul>
-        <li><b>Silero TTS</b> (model <code>v4_ru.pt</code>) — 
-            <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a>.
-            The neural network voice model is NOT bundled with this application.
-            Users must obtain the model independently. This tool is intended for
-            <b>strictly non-commercial, personal use</b> in compliance with Silero’s terms.
-            <b>This project does not generate revenue.</b>
-        </li>
-        <li><b>EasyOCR</b> — 
-            <a href="https://github.com/JaidedAI/EasyOCR/blob/master/LICENSE">Apache License 2.0</a>
-        </li>
-        <li><b>PyQt5</b> — 
-            <a href="https://www.riverbankcomputing.com/static/Docs/PyQt5/introduction.html">GPL v3</a>
-        </li>
-        <li><b>PyTorch</b> — 
-            <a href="https://github.com/pytorch/pytorch/blob/main/LICENSE">BSD-3-Clause</a>
-        </li>
-        <li><b>sounddevice</b> — 
-            <a href="https://github.com/spatialaudio/python-sounddevice/blob/master/LICENSE">MIT</a>
-        </li>
-        <li><b>OpenCV</b> — 
-            <a href="https://opencv.org/license/">Apache License 2.0</a>
-        </li>
-        <li><b>Pillow (PIL)</b> — 
-            <a href="https://raw.githubusercontent.com/python-pillow/Pillow/main/LICENSE">HPND</a>
-        </li>
-        <li><b>NumPy</b> — 
-            <a href="https://numpy.org/doc/stable/license.html">BSD-3-Clause</a>
-        </li>
-        <li><b>Requests</b> — 
-            <a href="https://github.com/psf/requests/blob/main/LICENSE">Apache License 2.0</a>
-        </li>
-        <li><b>pywin32</b> — 
-            <a href="https://github.com/mhammond/pywin32/blob/main/PyWin32/License.txt">PSF</a>
-        </li>
-        </ul>
-        <h3>Disclaimer regarding Genshin Impact</h3>
-        <p>
-        This software is not affiliated with, endorsed by, or supported by HoYoverse.
-        </p>
-        <p>
-        <b>Method:</b> This tool uses <b>OCR (Screen Capturing)</b> technology to read text
-        from the screen. It <b>does not inject code, modify game files, or read the game's
-        internal memory</b>. No copyrighted assets (audio, images, or code) from Genshin Impact
-        are included in this package.
-        </p>
-        <p>
-        The extracted text is used exclusively for immediate voice synthesis and is never
-        transmitted, stored, or processed for any other purpose.
-        </p>
-        <p>
-        <b>Use at your own risk.</b> The author is not responsible for any actions taken by
-        HoYoverse regarding user accounts.
-        </p>
-        <h3>Source code</h3>
-        <p>
-        The source code of Genshin Voice is available at:
-        <a href="https://github.com/egor9092-star/genshin-voice">https://github.com/egor9092-star/genshin-voice</a>.
-        </p>
-        """
+        html = (
+            '<h2>Genshin Voice</h2>\n'
+            '<p><b>Dialogue voiceover tool for Genshin Impact</b></p>\n'
+            '<p>This program is free software distributed under the terms of the\n'
+            '<a href="https://www.gnu.org/licenses/gpl-3.0.html">GNU General Public License v3.0 (GPLv3)</a>.\n'
+            'You may freely use, modify, and distribute this program, provided that any\n'
+            'derivative works are also distributed under the same license.</p>\n'
+            '<h3>Third-party components and licenses</h3>\n'
+            '<ul>\n'
+            '<li><b>Silero TTS</b> (model <code>v4_ru.pt</code>) — '
+            '<a href="https://creativecommons.org/licenses/by-nc-sa/4.0/">CC BY-NC-SA 4.0</a>. '
+            'The neural network voice model is NOT bundled with this application. '
+            'Users must obtain the model independently. This tool is intended for '
+            '<b>strictly non-commercial, personal use</b> in compliance with Silero’s terms. '
+            '<b>This project does not generate revenue.</b></li>\n'
+            '<li><b>Tesseract OCR</b> — '
+            '<a href="https://github.com/tesseract-ocr/tesseract/blob/main/LICENSE">Apache License 2.0</a></li>\n'
+            '<li><b>PyQt5</b> — <a href="https://www.riverbankcomputing.com/static/Docs/PyQt5/introduction.html">GPL v3</a></li>\n'
+            '<li><b>PyTorch</b> — <a href="https://github.com/pytorch/pytorch/blob/main/LICENSE">BSD-3-Clause</a></li>\n'
+            '<li><b>sounddevice</b> — <a href="https://github.com/spatialaudio/python-sounddevice/blob/master/LICENSE">MIT</a></li>\n'
+            '<li><b>OpenCV</b> — <a href="https://opencv.org/license/">Apache License 2.0</a></li>\n'
+            '<li><b>Pillow (PIL)</b> — <a href="https://raw.githubusercontent.com/python-pillow/Pillow/main/LICENSE">HPND</a></li>\n'
+            '<li><b>NumPy</b> — <a href="https://numpy.org/doc/stable/license.html">BSD-3-Clause</a></li>\n'
+            '<li><b>Requests</b> — <a href="https://github.com/psf/requests/blob/main/LICENSE">Apache License 2.0</a></li>\n'
+            '<li><b>pywin32</b> — <a href="https://github.com/mhammond/pywin32/blob/main/PyWin32/License.txt">PSF</a></li>\n'
+            '</ul>\n'
+            '<h3>Disclaimer regarding Genshin Impact</h3>\n'
+            '<p>This software is not affiliated with, endorsed by, or supported by HoYoverse.</p>\n'
+            '<p><b>Method:</b> This tool uses <b>OCR (Screen Capturing)</b> technology to read text '
+            'from the screen. It <b>does not inject code, modify game files, or read the game\'s '
+            'internal memory</b>. No copyrighted assets (audio, images, or code) from Genshin Impact '
+            'are included in this package.</p>\n'
+            '<p>The extracted text is used exclusively for immediate voice synthesis and is never '
+            'transmitted, stored, or processed for any other purpose.</p>\n'
+            '<p><b>Use at your own risk.</b> The author is not responsible for any actions taken by '
+            'HoYoverse regarding user accounts.</p>\n'
+            '<h3>Source code</h3>\n'
+            '<p>The source code of Genshin Voice is available at:\n'
+            '<a href="https://github.com/egor9092-star/GenshinVoice">https://github.com/egor9092-star/GenshinVoice</a>.</p>'
+        )
+        return html
 
     def init_sapi(self):
         global sapi_voice
@@ -425,20 +490,34 @@ class MainWindow(QMainWindow):
             print(f"Ошибка инициализации SAPI: {e}")
             sapi_voice = None
 
-    def init_ocr(self):
-        global ocr_reader
-        try:
-            print("Загрузка EasyOCR...")
-            ocr_reader = easyocr.Reader(['ru'], gpu=torch.cuda.is_available())
-            print("EasyOCR загружен.")
-        except Exception as e:
-            print(f"Ошибка загрузки EasyOCR: {e}")
-
     def start_worker_threads(self):
         threading.Thread(target=tts_worker, daemon=True).start()
         threading.Thread(target=recognition_worker, args=(self,), daemon=True).start()
 
-    # --- Управление голосом ---
+    # --- Tesseract ---
+    def select_tesseract(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Укажите tesseract.exe", "", "Executable (*.exe)")
+        if path and os.path.isfile(path):
+            self.set_tesseract_path(path)
+
+    def set_tesseract_path(self, path):
+        global TESSERACT_PATH
+        TESSERACT_PATH = path
+        configure_tesseract(path)
+        self.update_tesseract_status()
+        self.save_config()
+        print(f"Tesseract установлен: {path}")
+
+    def update_tesseract_status(self):
+        if TESSERACT_PATH and os.path.isfile(TESSERACT_PATH):
+            tessdata = os.environ.get('TESSDATA_PREFIX', 'неизвестно')
+            self.tess_path_label.setText(f"OK: {tessdata}")
+            self.tess_path_label.setStyleSheet("color: green;")
+        else:
+            self.tess_path_label.setText("Не найден")
+            self.tess_path_label.setStyleSheet("color: red;")
+
+    # --- управление голосом ---
     def on_win_clicked(self, checked):
         global use_silero_voice
         if checked:
@@ -452,23 +531,20 @@ class MainWindow(QMainWindow):
         else:
             if not self.silero_btn.isChecked():
                 self.win_btn.setChecked(True)
-                print("Нельзя отключить оба голоса. Windows Voice остаётся активным.")
 
     def on_silero_clicked(self, checked):
         global use_silero_voice, tts_model
         if not checked:
             if not self.win_btn.isChecked():
                 self.silero_btn.setChecked(True)
-                print("Нельзя отключить оба голоса.")
             return
-
         if not os.path.exists(MODEL_PATH):
             self.ask_download_model()
             self.silero_btn.setChecked(False)
             return
-
         if tts_model is None:
             try:
+                import torch
                 print("Загружаю модель Silero в память...")
                 tts_model = torch.package.PackageImporter(MODEL_PATH).load_pickle('tts_models', 'model')
                 tts_model.to(DEVICE)
@@ -477,7 +553,6 @@ class MainWindow(QMainWindow):
                 print(f"Ошибка загрузки модели: {e}")
                 self.silero_btn.setChecked(False)
                 return
-
         self.win_btn.setChecked(False)
         use_silero_voice = True
         self.silero_combo.setEnabled(True)
@@ -499,14 +574,11 @@ class MainWindow(QMainWindow):
             QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
             self.download_silero_model()
-        else:
-            print("Загрузка отменена пользователем.")
 
     def download_silero_model(self):
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         print(f"Скачивание модели с {OFFICIAL_MODEL_URL}...")
-        print(f"Файл будет сохранён в {MODEL_PATH}")
 
         def do_download():
             global tts_model, use_silero_voice
@@ -522,31 +594,28 @@ class MainWindow(QMainWindow):
                         percent = int(100 * downloaded / total_size)
                         self.progress_bar.setValue(percent)
                         QApplication.processEvents()
-                print("Загрузка завершена. Загружаем модель в память...")
                 self.progress_bar.setValue(100)
-
+                import torch
                 tts_model = torch.package.PackageImporter(MODEL_PATH).load_pickle('tts_models', 'model')
                 tts_model.to(DEVICE)
-                print("Модель Silero загружена и готова к работе.")
-
-                def activate_silero():
-                    self.silero_btn.setChecked(True)
-                    self.win_btn.setChecked(False)
-                    use_silero_voice = True
-                    self.silero_combo.setEnabled(True)
-                    self.status_label.setText(f"Статус: Silero Voice ({current_silero_speaker})")
-                    print(f"Автоматически выбран Silero с голосом {current_silero_speaker}")
-                    self.save_config()
-                QTimer.singleShot(0, activate_silero)
-
+                print("Модель Silero загружена.")
+                QTimer.singleShot(0, self.activate_silero_after_download)
             except Exception as e:
-                print(f"Ошибка при загрузке модели: {e}")
+                print(f"Ошибка загрузки модели: {e}")
                 if os.path.exists(MODEL_PATH):
                     os.remove(MODEL_PATH)
             finally:
                 self.progress_bar.setVisible(False)
 
         threading.Thread(target=do_download, daemon=True).start()
+
+    def activate_silero_after_download(self):
+        self.silero_btn.setChecked(True)
+        self.win_btn.setChecked(False)
+        use_silero_voice = True
+        self.silero_combo.setEnabled(True)
+        self.status_label.setText(f"Статус: Silero Voice ({current_silero_speaker})")
+        self.save_config()
 
     # --- Калибровка ---
     def start_calibration_countdown(self):
@@ -615,9 +684,57 @@ class MainWindow(QMainWindow):
 
     def update_status_bar(self):
         if self.dialogue_area:
-            self.status_bar.showMessage(f"Область: {self.dialogue_area}")
+            self.status_bar.showMessage("Область – ОК")
+            self.status_bar.setStyleSheet("color: green;")
         else:
-            self.status_bar.showMessage("Область не задана. Нажмите «Калибровать область».")
+            self.status_bar.showMessage("Область не захвачена, откалибруйте область")
+            self.status_bar.setStyleSheet("color: red;")
+
+    def show_tesseract_help_if_needed(self):
+        """Показывает пояснение о Tesseract, если он не найден."""
+        if TESSERACT_PATH and os.path.isfile(TESSERACT_PATH):
+            return
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowTitle("Tesseract не найден")
+        msg.setTextFormat(Qt.RichText)
+        msg.setText(
+            "<h3>Tesseract OCR не обнаружен</h3>"
+            "<p>Укажите путь к файлу <b>tesseract.exe</b>.</p>"
+            "<p>Обычно он находится в папке <code>bin/tesseract/</code>.</p>"
+            "<p>Рядом с <code>tesseract.exe</code> должна быть папка <b>tessdata</b> "
+            "с языковыми файлами (например, <code>rus.traineddata</code>).</p>"
+            "<p>В случае установки Tesseract с нуля, должен быть выбран additional language data - Русский и Math </b> "
+            "<p>Нажмите кнопку <b>«📂 Указать Tesseract»</b>, чтобы выбрать файл вручную.</p>"
+        )
+        msg.setStandardButtons(QMessageBox.Ok)
+        msg.exec_()
+
+    def update_genshin_status(self, active):
+        global genshin_active
+        genshin_active = active
+        if active:
+            self.game_status_label.setText("Genshin Impact активен")
+            self.game_status_label.setStyleSheet("color: green;")
+        else:
+            self.game_status_label.setText("GenshinImpact.exe не активен")
+            self.game_status_label.setStyleSheet("color: red;")
+        # Статус-бар теперь всегда показывает состояние области, поэтому не трогаем его
+
+    def check_game_window(self):
+        """Проверяет, является ли активное окно Genshin Impact, и обновляет статус."""
+        active = False
+        try:
+            from ctypes import windll, create_unicode_buffer
+            hwnd = windll.user32.GetForegroundWindow()
+            buf = create_unicode_buffer(512)
+            windll.user32.GetWindowTextW(hwnd, buf, 512)
+            if "Genshin Impact" in buf.value:
+                active = True
+        except:
+            pass
+        self.update_genshin_status(active)
+
 
 # --- Поток TTS ---
 def tts_worker():
@@ -634,6 +751,7 @@ def tts_worker():
                 prepared_text += '.'
 
             if use_silero_voice and tts_model is not None:
+                import torch
                 start_tts = time.perf_counter()
                 with torch.no_grad():
                     audio = tts_model.apply_tts(
@@ -641,11 +759,9 @@ def tts_worker():
                         speaker=current_silero_speaker,
                         sample_rate=SAMPLE_RATE
                     )
-                end_tts = time.perf_counter()
-                print(f"Синтез (Silero, {current_silero_speaker}): {(end_tts - start_tts)*1000:.0f} мс")
+                print(f"Синтез (Silero, {current_silero_speaker}): {(time.perf_counter() - start_tts)*1000:.0f} мс")
                 sd.play(audio.numpy(), SAMPLE_RATE)
                 sd.wait()
-                # Очистка кэша видеопамяти PyTorch для предотвращения роста потребления
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             else:
@@ -654,31 +770,28 @@ def tts_worker():
                     sapi_voice.Speak(prepared_text, 1)
                     while sapi_voice.Status.RunningState != 1:
                         time.sleep(0.05)
-                    end_tts = time.perf_counter()
-                    print(f"Синтез (SAPI): {(end_tts - start_tts)*1000:.0f} мс")
+                    print(f"Синтез (SAPI): {(time.perf_counter() - start_tts)*1000:.0f} мс")
                 else:
                     print("Нет доступного голосового движка!")
         except Exception as e:
             print(f"Ошибка TTS: {e}")
         voice_queue.task_done()
 
+
 # --- Поток распознавания ---
 def recognition_worker(main_window):
-    global paused, history, ocr_reader
+    global paused, history, last_voiced_text, genshin_active
     last_raw_text = ""
     stable_counter = 0
-    print("Поток распознавания запущен.")
+    print("Поток распознавания (Tesseract) запущен.")
     while True:
         if paused:
             time.sleep(0.1)
             continue
         try:
-            from ctypes import windll, create_unicode_buffer
-            hwnd = windll.user32.GetForegroundWindow()
-            buf = create_unicode_buffer(512)
-            windll.user32.GetWindowTextW(hwnd, buf, 512)
-            if "Genshin Impact" not in buf.value:
-                time.sleep(0.1)
+            if not genshin_active:
+                stable_counter, last_raw_text = 0, ""
+                time.sleep(0.2)
                 continue
 
             if not main_window.dialogue_area:
@@ -687,34 +800,42 @@ def recognition_worker(main_window):
 
             img = ImageGrab.grab(bbox=main_window.dialogue_area)
             img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-            processed_img = preprocess_image(img_bgr)
 
-            start_ocr = time.perf_counter()
-            result = ocr_reader.readtext(processed_img, detail=0, paragraph=True)
-            end_ocr = time.perf_counter()
+            current_text = get_text_from_image(img_bgr)
 
-            if result:
-                current_text = " ".join(result).strip()
+            if last_voiced_text and SequenceMatcher(None, current_text.strip(), last_voiced_text).ratio() > 0.85:
+                current_text = last_raw_text if last_raw_text else current_text
+
+            if current_text:
+                current_text = current_text.strip()
                 if current_text == last_raw_text and len(current_text) > 3:
                     stable_counter += 1
                 else:
                     stable_counter, last_raw_text = 0, current_text
 
                 if stable_counter == 2:
-                    print(f"OCR: {(end_ocr - start_ocr)*1000:.0f} мс")
                     clean = clean_ocr_text(current_text)
-                    if len(clean) > 3 and not (history and SequenceMatcher(None, clean, history[-1]).ratio() > 0.8):
-                        print(f">>> {clean}")
-                        voice_queue.put(clean)
-                        history.append(clean)
-                        if len(history) > 10:
-                            history.pop(0)
-                        stable_counter = 0
+                    if len(clean) > 3:
+                        already_voiced = False
+                        if history:
+                            for old_text in history[-2:]:
+                                if SequenceMatcher(None, clean, old_text).ratio() > 0.9:
+                                    already_voiced = True
+                                    break
+                        if not already_voiced:
+                            print(f">>> {clean}")
+                            voice_queue.put(clean)
+                            history.append(clean)
+                            last_voiced_text = clean
+                            if len(history) > 10:
+                                history.pop(0)
+                    stable_counter = 0
             else:
                 stable_counter, last_raw_text = 0, ""
         except Exception as e:
             print(f"Ошибка распознавания: {e}")
         time.sleep(0.1)
+
 
 # --- Запуск ---
 if __name__ == "__main__":
